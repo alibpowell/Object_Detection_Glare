@@ -78,7 +78,7 @@ This is a research prototype. The attack is successful for a target when YOLO no
 
 Smaller glare patches are more natural-looking, but they usually need more iterations than one large glare.
 
-The script defaults to `--iterations 800` and `--candidates-per-iter 12`. Use `--device cuda:0` to force the GPU; with `--device auto`, it will use CUDA when PyTorch sees a compatible GPU.
+The script defaults to `--iterations 800` and `--candidates-per-iter 12`. Use `--device cuda:0` on an NVIDIA CUDA machine, or `--device mps` on an Apple Silicon machine with PyTorch MPS available. With `--device auto`, it will try CUDA, then MPS, then CPU.
 
 For faster experiments, reduce YOLO input size or attack fewer targets:
 
@@ -106,6 +106,12 @@ The gradient attack can grow its light pattern when loss plateaus. It starts wit
 
 ```powershell
 python gradient_light_attack.py --image inputs\your_image.webp --weights yolov8n.pt --source-class person --steps 1800 --glare-count 5 --max-glare-count 14 --plateau-window 80 --plateau-delta 0.001 --growth-cooldown 40 --device cuda:0
+```
+
+On each plateau, the optimizer first tries to escape a local minimum by relocating the weakest glint and briefly refining several candidates. If none improve the loss, it grows the glare pattern when allowed:
+
+```powershell
+python gradient_light_attack.py --image inputs\your_image.webp --weights yolov8n.pt --source-class person --steps 1800 --glare-count 5 --max-glare-count 14 --teleport-candidates 12 --teleport-steps 30 --teleport-delta 0.0005 --device cuda:0
 ```
 
 To keep optimizing until the object disappears, use `--until-disappeared`. A practical capped run:

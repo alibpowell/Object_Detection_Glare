@@ -3,9 +3,13 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
+import tempfile
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "object_detection_glare_matplotlib"))
 
 import cv2
 import numpy as np
@@ -33,10 +37,25 @@ def parse_region(value: str | None):
     return tuple(parts)
 
 
+def resolve_image_path(path: Path) -> Path:
+    if path.exists():
+        return path
+    if not path.is_absolute() and path.parent == Path("."):
+        input_path = Path("inputs") / path.name
+        if input_path.exists():
+            print(f"Image {path} was not found; using {input_path}.")
+            return input_path
+    return path
+
+
 def choose_device(value: str) -> str:
     if value != "auto":
         return value
-    return "cuda:0" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        return "cuda:0"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 def describe_device(device: str) -> None:
@@ -46,6 +65,10 @@ def describe_device(device: str) -> None:
         index = int(device.split(":")[1]) if ":" in device else 0
         print(f"CUDA device: {torch.cuda.get_device_name(index)}")
         print(f"Torch CUDA: {torch.version.cuda}")
+    elif device == "mps":
+        if not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available():
+            raise RuntimeError("MPS was requested, but torch.backends.mps.is_available() is False.")
+        print("Apple GPU device: MPS")
     else:
         print("Running on CPU.")
 
@@ -98,8 +121,15 @@ def source_targets_from_detections(detections, source_class_id, region):
 def write_progress(path: Path, rows: list[dict]) -> None:
     if not rows:
         return
+    fieldnames = []
+    seen = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                fieldnames.append(key)
+                seen.add(key)
     with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -159,6 +189,8 @@ def try_teleport_weakest_glint(
         "state": original_state,
         "image": None,
         "raw_score": None,
+        "naturalness": None,
+        "relevant_predictions": None,
         "glints": None,
         "candidate": None,
     }
@@ -171,6 +203,8 @@ def try_teleport_weakest_glint(
         trial_best_state = clone_state(patch)
         trial_best_image = None
         trial_best_raw = None
+        trial_best_naturalness = None
+        trial_best_relevant = None
 
         for _ in range(max(1, args.teleport_steps)):
             result = run_patch_step(
@@ -187,6 +221,8 @@ def try_teleport_weakest_glint(
                 trial_best_state = clone_state(patch)
                 trial_best_image = result["attacked"]
                 trial_best_raw = result["raw_score"]
+                trial_best_naturalness = result["naturalness"]
+                trial_best_relevant = result["relevant_predictions"]
 
         if trial_best_score < best_trial["score"] - args.teleport_delta:
             patch.load_state_dict(trial_best_state)
@@ -196,6 +232,8 @@ def try_teleport_weakest_glint(
                 "state": trial_best_state,
                 "image": trial_best_image,
                 "raw_score": trial_best_raw,
+                "naturalness": trial_best_naturalness,
+                "relevant_predictions": trial_best_relevant,
                 "glints": patch.export(target_box_square),
                 "candidate": candidate,
             }
@@ -316,6 +354,14 @@ def optimize_target(
                     best["step"] = step
                     best["raw_score"] = teleport["raw_score"]
                     best["glare_count"] = patch.glare_count
+                    attacked = best["image"]
+                    score_value = best["score"]
+                    raw_value = best["raw_score"]
+                    progress[-1]["loss"] = score_value
+                    progress[-1]["raw_score"] = raw_value
+                    progress[-1]["naturalness"] = teleport["naturalness"]
+                    progress[-1]["relevant_predictions"] = teleport["relevant_predictions"]
+                    progress[-1]["glare_count"] = patch.glare_count
                     growth_events.append(
                         {
                             "target_index": target_index,
@@ -354,6 +400,24 @@ def optimize_target(
                     f"Plateau detected at step {step}; "
                     f"added glint {patch.glare_count}/{max_text}."
                 )
+            elif not teleported:
+                last_growth_step = step
+                if args.teleport_on_plateau:
+                    growth_events.append(
+                        {
+                            "target_index": target_index,
+                            "step": step,
+                            "reason": "teleport_failed",
+                            "glare_count": patch.glare_count,
+                            "best_loss": best["score"],
+                            "teleport_candidates": args.teleport_candidates,
+                            "teleport_steps": args.teleport_steps,
+                        }
+                    )
+                    print(
+                        f"Plateau detected at step {step}; teleport did not improve "
+                        f"and glare count is capped at {patch.glare_count}."
+                    )
 
         if args.until_disappeared and (step % args.check_every == 0 or step == max_steps - 1):
             with torch.no_grad():
@@ -412,6 +476,36 @@ def main() -> None:
     parser.add_argument("--plateau-window", type=int, default=80)
     parser.add_argument("--plateau-delta", type=float, default=1e-3)
     parser.add_argument("--growth-cooldown", type=int, default=40)
+    parser.add_argument(
+        "--teleport-on-plateau",
+        action="store_true",
+        default=True,
+        help="When loss plateaus, try random relocations of the weakest glint before adding a new one.",
+    )
+    parser.add_argument(
+        "--no-teleport-on-plateau",
+        action="store_false",
+        dest="teleport_on_plateau",
+        help="Disable plateau relocation and only grow the glare pattern when possible.",
+    )
+    parser.add_argument(
+        "--teleport-candidates",
+        type=int,
+        default=8,
+        help="Random relocated positions to try for the weakest glint on each plateau.",
+    )
+    parser.add_argument(
+        "--teleport-steps",
+        type=int,
+        default=20,
+        help="Short Adam refinement steps for each relocated glint candidate.",
+    )
+    parser.add_argument(
+        "--teleport-delta",
+        type=float,
+        default=5e-4,
+        help="Minimum loss improvement required to accept a relocated glint.",
+    )
     parser.add_argument("--naturalness-weight", type=float, default=0.08)
     parser.add_argument("--min-size-frac", type=float, default=0.025)
     parser.add_argument("--max-size-frac", type=float, default=0.16)
@@ -426,6 +520,12 @@ def main() -> None:
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
     args.check_every = max(1, args.check_every)
+    args.print_every = max(1, args.print_every)
+    args.plateau_window = max(1, args.plateau_window)
+    args.growth_cooldown = max(1, args.growth_cooldown)
+    args.teleport_candidates = max(1, args.teleport_candidates)
+    args.teleport_steps = max(1, args.teleport_steps)
+    args.teleport_delta = max(0.0, args.teleport_delta)
     if args.max_glare_count > 0 and args.max_glare_count < args.glare_count:
         args.max_glare_count = args.glare_count
 
@@ -433,7 +533,7 @@ def main() -> None:
     describe_device(device)
     output_dir = ensure_dir(args.output or Path("outputs") / f"gradient_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
 
-    image_path = Path(args.image)
+    image_path = resolve_image_path(Path(args.image))
     image_bgr = load_image_bgr(image_path)
     height, width = image_bgr.shape[:2]
 
@@ -555,6 +655,10 @@ def main() -> None:
         "plateau_window": args.plateau_window,
         "plateau_delta": args.plateau_delta,
         "growth_cooldown": args.growth_cooldown,
+        "teleport_on_plateau": args.teleport_on_plateau,
+        "teleport_candidates": args.teleport_candidates,
+        "teleport_steps": args.teleport_steps,
+        "teleport_delta": args.teleport_delta,
         "growth_events": all_growth_events,
         "naturalness_weight": args.naturalness_weight,
         "min_size_frac": args.min_size_frac,
