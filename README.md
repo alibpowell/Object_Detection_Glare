@@ -126,6 +126,8 @@ To keep optimizing until the object disappears, use `--until-disappeared`. A pra
 python gradient_light_attack.py --image inputs\your_image.webp --weights yolov8n.pt --source-class person --until-disappeared --max-steps 5000 --check-every 50 --glare-count 5 --max-glare-count 18 --plateau-window 80 --plateau-delta 0.001 --growth-cooldown 40 --device cuda:0
 ```
 
+Disappearance means no YOLO detection of any class overlaps the original target box. If the original `person` becomes a different class such as `tie`, the target is not counted as disappeared. The summary also reports `image_fully_clear` for whether the whole final image has zero detections.
+
 For an uncapped run, set both caps to `0` and stop manually with `Ctrl+C` if needed:
 
 ```powershell

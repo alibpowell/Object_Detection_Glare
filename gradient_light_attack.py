@@ -23,7 +23,6 @@ from yolo_utils import (
     box_iou,
     class_id_from_name,
     detections_from_result,
-    max_detection_score,
     run_yolo,
 )
 
@@ -116,6 +115,22 @@ def source_targets_from_detections(detections, source_class_id, region):
             }
         )
     return targets
+
+
+def max_any_detection_score(
+    detections: list[dict],
+    region: tuple[float, float, float, float],
+    min_iou: float = 0.05,
+) -> tuple[float, dict | None]:
+    best_score = 0.0
+    best_detection = None
+    for det in detections:
+        if box_iou(tuple(det["xyxy"]), region) < min_iou:
+            continue
+        if det["confidence"] > best_score:
+            best_score = det["confidence"]
+            best_detection = det
+    return best_score, best_detection
 
 
 def write_progress(path: Path, rows: list[dict]) -> None:
@@ -477,9 +492,16 @@ def optimize_target(
                 )
                 check_detections = detections_from_result(check_result)
                 check_box = tuple(float(v) for v in target_box_original.detach().cpu().tolist())
-                actual_score = max_detection_score(check_detections, target["class_id"], check_box)
+                actual_score, actual_detection = max_any_detection_score(check_detections, check_box)
                 progress[-1]["actual_detection_score"] = actual_score
-                print(f"Actual original-size YOLO check at step {step}: score={actual_score:.4f}")
+                progress[-1]["actual_detection_class"] = (
+                    actual_detection["class_name"] if actual_detection else None
+                )
+                print(
+                    "Actual original-size YOLO check at step "
+                    f"{step}: any-overlap score={actual_score:.4f} "
+                    f"class={actual_detection['class_name'] if actual_detection else 'none'}"
+                )
                 if actual_score == 0.0:
                     best["score"] = score_value
                     best["attack_score"] = raw_value
@@ -693,8 +715,11 @@ def main() -> None:
 
     for record in patches:
         target = record["target"]
-        final_score = max_detection_score(attacked_detections, target["class_id"], tuple(target["xyxy"]))
+        final_score, final_detection = max_any_detection_score(attacked_detections, tuple(target["xyxy"]))
         record["final_score"] = final_score
+        record["final_detection"] = final_detection
+        record["final_detection_class"] = final_detection["class_name"] if final_detection else None
+        record["final_detection_class_id"] = final_detection["class_id"] if final_detection else None
         record["disappeared"] = final_score == 0.0
 
     write_progress(output_dir / "gradient_progress.csv", all_progress)
@@ -726,6 +751,7 @@ def main() -> None:
         "raw_topk": args.raw_topk,
         "source_class_id": source_class_id,
         "source_targets": targets,
+        "image_fully_clear": len(attacked_detections) == 0,
         "success_count": sum(1 for record in patches if record["disappeared"]),
         "target_count": len(patches),
         "all_disappeared": all(record["disappeared"] for record in patches),
