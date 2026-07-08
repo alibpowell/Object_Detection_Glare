@@ -133,6 +133,99 @@ def max_any_detection_score(
     return best_score, best_detection
 
 
+def glint_count(glints) -> int:
+    return len(glints.center)
+
+
+def remove_glint(glints, index: int):
+    from torch_light_patch import ExportedGlints
+
+    return ExportedGlints(
+        center=[value for idx, value in enumerate(glints.center) if idx != index],
+        radius=[value for idx, value in enumerate(glints.radius) if idx != index],
+        angle=[value for idx, value in enumerate(glints.angle) if idx != index],
+        opacity=[value for idx, value in enumerate(glints.opacity) if idx != index],
+        intensity=[value for idx, value in enumerate(glints.intensity) if idx != index],
+        color_rgb=[value for idx, value in enumerate(glints.color_rgb) if idx != index],
+    )
+
+
+def evaluate_glints_on_original(
+    detect_model,
+    base_image_original: torch.Tensor,
+    target_box_original: torch.Tensor,
+    glints,
+    args,
+    device: str,
+) -> tuple[float, dict | None, torch.Tensor]:
+    attacked_original, _ = render_exported_glints(base_image_original, target_box_original, glints)
+    result = run_yolo(
+        detect_model,
+        tensor_rgb_to_bgr(attacked_original),
+        device=device,
+        conf=args.conf,
+        iou=args.iou,
+        imgsz=args.imgsz,
+    )
+    detections = detections_from_result(result)
+    target_box = tuple(float(v) for v in target_box_original.detach().cpu().tolist())
+    score, detection = max_any_detection_score(detections, target_box)
+    return score, detection, attacked_original
+
+
+def prune_successful_glints(
+    detect_model,
+    base_image_original: torch.Tensor,
+    target_box_original: torch.Tensor,
+    glints,
+    target: dict,
+    args,
+    device: str,
+) -> tuple[object, list[dict], torch.Tensor]:
+    events = []
+    current_glints = glints
+    current_score, current_detection, current_image = evaluate_glints_on_original(
+        detect_model,
+        base_image_original,
+        target_box_original,
+        current_glints,
+        args,
+        device,
+    )
+    if current_score != 0.0:
+        return current_glints, events, current_image
+
+    changed = True
+    while changed and glint_count(current_glints) > 1:
+        changed = False
+        for index in range(glint_count(current_glints)):
+            candidate_glints = remove_glint(current_glints, index)
+            score, detection, image = evaluate_glints_on_original(
+                detect_model,
+                base_image_original,
+                target_box_original,
+                candidate_glints,
+                args,
+                device,
+            )
+            if score == 0.0:
+                events.append(
+                    {
+                        "removed_glint_index": index,
+                        "glare_count_before": glint_count(current_glints),
+                        "glare_count_after": glint_count(candidate_glints),
+                        "post_prune_score": score,
+                        "post_prune_class": detection["class_name"] if detection else None,
+                    }
+                )
+                current_glints = candidate_glints
+                current_image = image
+                changed = True
+                break
+
+    return current_glints, events, current_image
+
+
 def write_progress(path: Path, rows: list[dict]) -> None:
     if not rows:
         return
@@ -540,6 +633,18 @@ def main() -> None:
     parser.add_argument("--until-disappeared", action="store_true")
     parser.add_argument("--max-steps", type=int, default=0, help="Only used with --until-disappeared. 0 means no cap.")
     parser.add_argument("--check-every", type=int, default=50)
+    parser.add_argument(
+        "--prune-glints",
+        action="store_true",
+        default=True,
+        help="After a target disappears, remove any glints that are not needed to keep it disappeared.",
+    )
+    parser.add_argument(
+        "--no-prune-glints",
+        action="store_false",
+        dest="prune_glints",
+        help="Disable post-success glint pruning.",
+    )
     parser.add_argument("--lr", type=float, default=0.06)
     parser.add_argument("--glare-count", type=int, default=5)
     parser.add_argument("--max-glare-count", type=int, default=12)
@@ -648,6 +753,7 @@ def main() -> None:
     current_original = original_tensor.detach()
     all_progress = []
     all_growth_events = []
+    all_prune_events = []
     patches = []
 
     for target_index, target in enumerate(targets):
@@ -666,10 +772,37 @@ def main() -> None:
             target_index,
             device,
         )
-        current_square = best["image"].detach()
-        current_original, _ = render_exported_glints(current_original, target_box_original, best["glints"])
+        prune_events = []
+        if args.prune_glints and best["stop_reason"] == "disappeared":
+            before_count = glint_count(best["glints"])
+            best["glints"], prune_events, current_original = prune_successful_glints(
+                detect_yolo,
+                current_original,
+                target_box_original,
+                best["glints"],
+                args,
+                device,
+            )
+            if prune_events:
+                after_count = glint_count(best["glints"])
+                print(f"Pruned target glints {before_count} -> {after_count}.")
+            best["glare_count"] = glint_count(best["glints"])
+        else:
+            current_original, _ = render_exported_glints(current_original, target_box_original, best["glints"])
+
+        current_square, _ = render_exported_glints(current_square, target_box_square, best["glints"])
+        current_square = current_square.detach()
+        current_original = current_original.detach()
         all_progress.extend(progress)
         all_growth_events.extend(growth_events)
+        for event in prune_events:
+            all_prune_events.append(
+                {
+                    "target_index": target_index,
+                    "target_class": target["class_name"],
+                    **event,
+                }
+            )
         patches.append(
             {
                 "target_index": target_index,
@@ -682,6 +815,8 @@ def main() -> None:
                 "actual_detection_score": best["actual_detection_score"],
                 "stop_reason": best["stop_reason"],
                 "steps_run": best["steps_run"],
+                "prune_events": prune_events,
+                "pruned_glare_count": glint_count(best["glints"]),
                 "glints": asdict(best["glints"]),
             }
         )
@@ -724,6 +859,7 @@ def main() -> None:
 
     write_progress(output_dir / "gradient_progress.csv", all_progress)
     write_progress(output_dir / "growth_events.csv", all_growth_events)
+    write_progress(output_dir / "prune_events.csv", all_prune_events)
     summary = {
         "image": str(image_path),
         "weights": args.weights,
@@ -734,6 +870,7 @@ def main() -> None:
         "until_disappeared": args.until_disappeared,
         "max_steps": args.max_steps,
         "check_every": args.check_every,
+        "prune_glints": args.prune_glints,
         "lr": args.lr,
         "glare_count": args.glare_count,
         "max_glare_count": args.max_glare_count,
@@ -745,6 +882,7 @@ def main() -> None:
         "teleport_steps": args.teleport_steps,
         "teleport_delta": args.teleport_delta,
         "growth_events": all_growth_events,
+        "prune_events": all_prune_events,
         "naturalness_weight": args.naturalness_weight,
         "min_size_frac": args.min_size_frac,
         "max_size_frac": args.max_size_frac,

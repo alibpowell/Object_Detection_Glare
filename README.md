@@ -128,6 +128,8 @@ python gradient_light_attack.py --image inputs\your_image.webp --weights yolov8n
 
 Disappearance means no YOLO detection of any class overlaps the original target box. If the original `person` becomes a different class such as `tie`, the target is not counted as disappeared. The summary also reports `image_fully_clear` for whether the whole final image has zero detections.
 
+After a target disappears, the gradient attack prunes unnecessary glints by removing one at a time and keeping each removal only if the target still has no overlapping detection. Use `--no-prune-glints` to keep the first successful glare pattern unchanged.
+
 For an uncapped run, set both caps to `0` and stop manually with `Ctrl+C` if needed:
 
 ```powershell
