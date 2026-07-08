@@ -108,7 +108,7 @@ The gradient attack can grow its light pattern when loss plateaus. It starts wit
 python gradient_light_attack.py --image inputs\your_image.webp --weights yolov8n.pt --source-class person --steps 1800 --glare-count 5 --max-glare-count 14 --plateau-window 80 --plateau-delta 0.001 --growth-cooldown 40 --device cuda:0
 ```
 
-On each plateau, the optimizer first tries to escape a local minimum by relocating the weakest glint and briefly refining several candidates. If none improve the loss, it grows the glare pattern when allowed:
+On each plateau, the optimizer first tries to escape a local minimum by relocating the weakest glint and briefly refining several candidates. A relocation is accepted only when it improves the raw detector score for the target object; if none improve that attack score, it grows the glare pattern when allowed:
 
 ```powershell
 python gradient_light_attack.py --image inputs\your_image.webp --weights yolov8n.pt --source-class person --steps 1800 --glare-count 5 --max-glare-count 14 --teleport-candidates 12 --teleport-steps 30 --teleport-delta 0.0005 --device cuda:0

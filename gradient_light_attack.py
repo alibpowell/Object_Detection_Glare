@@ -148,6 +148,7 @@ def run_patch_step(
     args,
 ):
     optimizer.zero_grad(set_to_none=True)
+    state_before_step = clone_state(patch)
     attacked, mask = patch(base_image_square, target_box_square)
     output = raw_model(attacked)
     det_loss, raw_score, relevant_count = disappearance_loss(
@@ -167,7 +168,20 @@ def run_patch_step(
         "naturalness": float(naturalness.detach().item()),
         "relevant_predictions": relevant_count,
         "attacked": attacked.detach(),
+        "state": state_before_step,
     }
+
+
+def export_from_state(
+    patch: GradientLightPatch,
+    state: dict[str, torch.Tensor],
+    target_box_square: torch.Tensor,
+) -> object:
+    current_state = clone_state(patch)
+    patch.load_state_dict(state)
+    glints = patch.export(target_box_square)
+    patch.load_state_dict(current_state)
+    return glints
 
 
 def try_teleport_weakest_glint(
@@ -179,13 +193,15 @@ def try_teleport_weakest_glint(
     args,
     target_index: int,
     step: int,
-    best_score: float,
+    best_attack_score: float,
+    best_loss: float,
 ) -> dict:
     original_state = clone_state(patch)
     weakest_index = patch.weakest_glint_index(target_box_square)
     best_trial = {
         "improved": False,
-        "score": best_score,
+        "attack_score": best_attack_score,
+        "loss": best_loss,
         "state": original_state,
         "image": None,
         "raw_score": None,
@@ -199,7 +215,8 @@ def try_teleport_weakest_glint(
         patch.load_state_dict(original_state)
         patch.randomize_glint(weakest_index)
         trial_optimizer = torch.optim.Adam(patch.parameters(), lr=args.lr)
-        trial_best_score = float("inf")
+        trial_best_attack_score = float("inf")
+        trial_best_loss = float("inf")
         trial_best_state = clone_state(patch)
         trial_best_image = None
         trial_best_raw = None
@@ -216,19 +233,25 @@ def try_teleport_weakest_glint(
                 target_box_square,
                 args,
             )
-            if result["loss"] < trial_best_score:
-                trial_best_score = result["loss"]
-                trial_best_state = clone_state(patch)
+            attack_score = result["raw_score"]
+            loss_score = result["loss"]
+            raw_improved = attack_score < trial_best_attack_score - args.plateau_delta
+            raw_tied = abs(attack_score - trial_best_attack_score) <= args.plateau_delta
+            if raw_improved or (raw_tied and loss_score < trial_best_loss):
+                trial_best_attack_score = attack_score
+                trial_best_loss = loss_score
+                trial_best_state = result["state"]
                 trial_best_image = result["attacked"]
                 trial_best_raw = result["raw_score"]
                 trial_best_naturalness = result["naturalness"]
                 trial_best_relevant = result["relevant_predictions"]
 
-        if trial_best_score < best_trial["score"] - args.teleport_delta:
+        if trial_best_attack_score < best_trial["attack_score"] - args.teleport_delta:
             patch.load_state_dict(trial_best_state)
             best_trial = {
                 "improved": True,
-                "score": trial_best_score,
+                "attack_score": trial_best_attack_score,
+                "loss": trial_best_loss,
                 "state": trial_best_state,
                 "image": trial_best_image,
                 "raw_score": trial_best_raw,
@@ -247,8 +270,10 @@ def try_teleport_weakest_glint(
         "teleported_glint": weakest_index,
         "teleport_candidates": args.teleport_candidates,
         "teleport_steps": args.teleport_steps,
-        "best_loss_before": best_score,
-        "best_loss_after": best_trial["score"],
+        "best_attack_score_before": best_attack_score,
+        "best_attack_score_after": best_trial["attack_score"],
+        "best_loss_before": best_loss,
+        "best_loss_after": best_trial["loss"],
         **best_trial,
     }
 
@@ -273,8 +298,10 @@ def optimize_target(
     optimizer = torch.optim.Adam(patch.parameters(), lr=args.lr)
     best = {
         "score": float("inf"),
+        "attack_score": float("inf"),
         "image": base_image_square.detach(),
         "glints": None,
+        "state": None,
         "step": -1,
         "raw_score": None,
         "glare_count": patch.glare_count,
@@ -316,11 +343,13 @@ def optimize_target(
                 "actual_detection_score": None,
             }
         )
-        improved = score_value < best["score"] - args.plateau_delta
-        if score_value < best["score"]:
+        improved = raw_value < best["attack_score"] - args.plateau_delta
+        if raw_value < best["attack_score"]:
             best["score"] = score_value
+            best["attack_score"] = raw_value
             best["image"] = attacked.detach()
-            best["glints"] = patch.export(target_box_square)
+            best["state"] = step_result["state"]
+            best["glints"] = export_from_state(patch, step_result["state"], target_box_square)
             best["step"] = step
             best["raw_score"] = raw_value
             best["glare_count"] = patch.glare_count
@@ -342,15 +371,18 @@ def optimize_target(
                     args,
                     target_index,
                     step,
+                    best["attack_score"],
                     best["score"],
                 )
                 if teleport["improved"]:
                     optimizer = torch.optim.Adam(patch.parameters(), lr=args.lr)
                     last_growth_step = step
                     last_improvement_step = step
-                    best["score"] = teleport["score"]
+                    best["score"] = teleport["loss"]
+                    best["attack_score"] = teleport["attack_score"]
                     best["image"] = teleport["image"]
                     best["glints"] = teleport["glints"]
+                    best["state"] = teleport["state"]
                     best["step"] = step
                     best["raw_score"] = teleport["raw_score"]
                     best["glare_count"] = patch.glare_count
@@ -371,6 +403,8 @@ def optimize_target(
                             "teleported_glint": teleport["teleported_glint"],
                             "teleport_candidates": args.teleport_candidates,
                             "teleport_steps": args.teleport_steps,
+                            "best_attack_score_before": teleport["best_attack_score_before"],
+                            "best_attack_score_after": teleport["best_attack_score_after"],
                             "best_loss_before": teleport["best_loss_before"],
                             "best_loss_after": teleport["best_loss_after"],
                         }
@@ -379,7 +413,8 @@ def optimize_target(
                     print(
                         f"Plateau detected at step {step}; teleported glint "
                         f"{teleport['teleported_glint']} and improved "
-                        f"{teleport['best_loss_before']:.4f} -> {teleport['best_loss_after']:.4f}."
+                        f"raw score {teleport['best_attack_score_before']:.4f} "
+                        f"-> {teleport['best_attack_score_after']:.4f}."
                     )
 
             if not teleported and can_grow:
@@ -392,6 +427,7 @@ def optimize_target(
                     "step": step,
                     "new_glare_count": patch.glare_count,
                     "best_loss": best["score"],
+                    "best_attack_score": best["attack_score"],
                     "reason": "plateau",
                 }
                 growth_events.append(growth_event)
@@ -410,6 +446,7 @@ def optimize_target(
                             "reason": "teleport_failed",
                             "glare_count": patch.glare_count,
                             "best_loss": best["score"],
+                            "best_attack_score": best["attack_score"],
                             "teleport_candidates": args.teleport_candidates,
                             "teleport_steps": args.teleport_steps,
                         }
@@ -437,8 +474,10 @@ def optimize_target(
                 print(f"Actual YOLO check at step {step}: score={actual_score:.4f}")
                 if actual_score == 0.0:
                     best["score"] = score_value
+                    best["attack_score"] = raw_value
                     best["image"] = attacked.detach()
-                    best["glints"] = patch.export(target_box_square)
+                    best["state"] = step_result["state"]
+                    best["glints"] = export_from_state(patch, step_result["state"], target_box_square)
                     best["step"] = step
                     best["raw_score"] = raw_value
                     best["glare_count"] = patch.glare_count
@@ -504,7 +543,7 @@ def main() -> None:
         "--teleport-delta",
         type=float,
         default=5e-4,
-        help="Minimum loss improvement required to accept a relocated glint.",
+        help="Minimum raw detector-score improvement required to accept a relocated glint.",
     )
     parser.add_argument("--naturalness-weight", type=float, default=0.08)
     parser.add_argument("--min-size-frac", type=float, default=0.025)
@@ -594,6 +633,7 @@ def main() -> None:
                 "target": target,
                 "best_step": best["step"],
                 "best_loss": best["score"],
+                "best_attack_score": best["attack_score"],
                 "best_raw_score": best["raw_score"],
                 "best_glare_count": best["glare_count"],
                 "actual_detection_score": best["actual_detection_score"],
