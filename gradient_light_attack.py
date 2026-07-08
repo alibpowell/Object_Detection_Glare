@@ -157,6 +157,7 @@ def run_patch_step(
         target_box_square,
         min_iou=args.raw_iou,
         temperature=args.temperature,
+        topk=args.raw_topk,
     )
     naturalness = patch.naturalness_loss(mask, target_box_square)
     loss = det_loss + args.naturalness_weight * naturalness
@@ -282,8 +283,10 @@ def optimize_target(
     raw_model,
     detect_model,
     base_image_square: torch.Tensor,
+    base_image_original: torch.Tensor,
     target: dict,
     target_box_square: torch.Tensor,
+    target_box_original: torch.Tensor,
     args,
     target_index: int,
     device: str,
@@ -359,8 +362,8 @@ def optimize_target(
         plateaued = step - last_improvement_step >= args.plateau_window
         cooled_down = step - last_growth_step >= args.growth_cooldown
         can_grow = args.max_glare_count <= 0 or patch.glare_count < args.max_glare_count
+        teleported = False
         if plateaued and cooled_down:
-            teleported = False
             if args.teleport_on_plateau and patch.glare_count > 0:
                 teleport = try_teleport_weakest_glint(
                     raw_model,
@@ -458,7 +461,12 @@ def optimize_target(
 
         if args.until_disappeared and (step % args.check_every == 0 or step == max_steps - 1):
             with torch.no_grad():
-                check_bgr = tensor_rgb_to_bgr(attacked)
+                if teleported:
+                    check_glints = best["glints"]
+                else:
+                    check_glints = export_from_state(patch, step_result["state"], target_box_square)
+                check_original, _ = render_exported_glints(base_image_original, target_box_original, check_glints)
+                check_bgr = tensor_rgb_to_bgr(check_original)
                 check_result = run_yolo(
                     detect_model,
                     check_bgr,
@@ -468,16 +476,17 @@ def optimize_target(
                     imgsz=args.imgsz,
                 )
                 check_detections = detections_from_result(check_result)
-                check_box = tuple(float(v) for v in target_box_square.detach().cpu().tolist())
+                check_box = tuple(float(v) for v in target_box_original.detach().cpu().tolist())
                 actual_score = max_detection_score(check_detections, target["class_id"], check_box)
                 progress[-1]["actual_detection_score"] = actual_score
-                print(f"Actual YOLO check at step {step}: score={actual_score:.4f}")
+                print(f"Actual original-size YOLO check at step {step}: score={actual_score:.4f}")
                 if actual_score == 0.0:
                     best["score"] = score_value
                     best["attack_score"] = raw_value
                     best["image"] = attacked.detach()
-                    best["state"] = step_result["state"]
-                    best["glints"] = export_from_state(patch, step_result["state"], target_box_square)
+                    if not teleported:
+                        best["state"] = step_result["state"]
+                    best["glints"] = check_glints
                     best["step"] = step
                     best["raw_score"] = raw_value
                     best["glare_count"] = patch.glare_count
@@ -549,7 +558,13 @@ def main() -> None:
     parser.add_argument("--min-size-frac", type=float, default=0.025)
     parser.add_argument("--max-size-frac", type=float, default=0.16)
     parser.add_argument("--raw-iou", type=float, default=0.03)
-    parser.add_argument("--temperature", type=float, default=0.08)
+    parser.add_argument(
+        "--raw-topk",
+        type=int,
+        default=128,
+        help="Optimize only the top-K relevant raw YOLO predictions. 0 uses all relevant predictions.",
+    )
+    parser.add_argument("--temperature", type=float, default=0.03)
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--iou", type=float, default=0.7)
     parser.add_argument("--imgsz", type=int, default=640)
@@ -607,6 +622,8 @@ def main() -> None:
 
     square_image = image_bgr_to_tensor_rgb(image_bgr, device=device, size=args.imgsz)
     current_square = square_image.detach()
+    original_tensor = image_bgr_to_tensor_rgb(image_bgr, device=device, size=None)
+    current_original = original_tensor.detach()
     all_progress = []
     all_growth_events = []
     patches = []
@@ -614,17 +631,21 @@ def main() -> None:
     for target_index, target in enumerate(targets):
         print(f"\nOptimizing target {target_index + 1}/{len(targets)}: {target['class_name']}")
         target_box_square = scale_box_to_square(target["xyxy"], width, height, args.imgsz, device)
+        target_box_original = box_tensor(target["xyxy"], device)
         best, progress, growth_events = optimize_target(
             grad_yolo.model,
             detect_yolo,
             current_square,
+            current_original,
             target,
             target_box_square,
+            target_box_original,
             args,
             target_index,
             device,
         )
         current_square = best["image"].detach()
+        current_original, _ = render_exported_glints(current_original, target_box_original, best["glints"])
         all_progress.extend(progress)
         all_growth_events.extend(growth_events)
         patches.append(
@@ -643,7 +664,6 @@ def main() -> None:
             }
         )
 
-    original_tensor = image_bgr_to_tensor_rgb(image_bgr, device=device, size=None)
     attacked_original = original_tensor.detach()
     combined_mask = torch.zeros((height, width), device=device, dtype=torch.float32)
     for record in patches:
@@ -703,6 +723,7 @@ def main() -> None:
         "naturalness_weight": args.naturalness_weight,
         "min_size_frac": args.min_size_frac,
         "max_size_frac": args.max_size_frac,
+        "raw_topk": args.raw_topk,
         "source_class_id": source_class_id,
         "source_targets": targets,
         "success_count": sum(1 for record in patches if record["disappeared"]),

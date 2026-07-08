@@ -114,6 +114,12 @@ On each plateau, the optimizer first tries to escape a local minimum by relocati
 python gradient_light_attack.py --image inputs\your_image.webp --weights yolov8n.pt --source-class person --steps 1800 --glare-count 5 --max-glare-count 14 --teleport-candidates 12 --teleport-steps 30 --teleport-delta 0.0005 --device cuda:0
 ```
 
+For large targets, `--raw-topk` keeps the differentiable loss focused on the highest-scoring raw YOLO predictions instead of spreading gradient over thousands of weak predictions:
+
+```powershell
+python gradient_light_attack.py --image inputs\your_image.webp --weights yolov8n.pt --source-class person --steps 1800 --raw-topk 128 --device cuda:0
+```
+
 To keep optimizing until the object disappears, use `--until-disappeared`. A practical capped run:
 
 ```powershell

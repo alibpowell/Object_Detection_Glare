@@ -31,6 +31,7 @@ def disappearance_loss(
     target_box_xyxy: torch.Tensor,
     min_iou: float = 0.03,
     temperature: float = 0.08,
+    topk: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     preds = raw_predictions(model_output)
     if preds.ndim != 3:
@@ -53,7 +54,8 @@ def disappearance_loss(
         relevant = torch.ones_like(class_scores, dtype=torch.bool)
 
     selected = class_scores[relevant]
+    if topk > 0 and selected.numel() > topk:
+        selected = torch.topk(selected, k=topk).values
     smooth_max = temperature * torch.logsumexp(selected / temperature, dim=0)
     observed_max = selected.max().detach()
     return smooth_max, observed_max, int(relevant.sum().item())
-
