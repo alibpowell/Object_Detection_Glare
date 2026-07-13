@@ -96,6 +96,14 @@ Candidates are evaluated in batches, so increasing `--candidates-per-iter` is us
 python gradient_light_attack.py --image cartestimage.avif --weights yolov8n.pt --source-class car --steps 500 --glare-count 5 --imgsz 640 --device cuda:0
 ```
 
+For the least manual tuning, use auto attack mode. It enables `--until-disappeared`, uses stronger capped defaults, and escalates when real YOLO checks stall:
+
+```powershell
+python gradient_light_attack.py --image inputs\your_image.webp --weights yolov8n.pt --source-class car --auto-attack --device auto
+```
+
+Auto attack still cannot guarantee every image/model combination, but it avoids unlimited silent runs by recording whether it stopped because the target disappeared, the step budget ended, or escalation was exhausted.
+
 For a stronger run:
 
 ```powershell

@@ -226,6 +226,27 @@ def prune_successful_glints(
     return current_glints, events, current_image
 
 
+def apply_auto_attack_defaults(args) -> None:
+    if not args.auto_attack:
+        return
+    args.until_disappeared = True
+    if args.max_steps <= 0:
+        args.max_steps = 3500
+    args.check_every = min(args.check_every, 25)
+    args.glare_count = max(args.glare_count, 3)
+    if args.max_glare_count > 0:
+        args.max_glare_count = max(args.max_glare_count, 24)
+    args.teleport_candidates = max(args.teleport_candidates, 12)
+    args.teleport_steps = max(args.teleport_steps, 30)
+    args.plateau_window = min(args.plateau_window, 60)
+    args.growth_cooldown = min(args.growth_cooldown, 30)
+    args.naturalness_weight = min(args.naturalness_weight, 0.03)
+    args.max_size_frac = max(args.max_size_frac, 0.24)
+    args.raw_topk = 64 if args.raw_topk <= 0 else min(args.raw_topk, 64)
+    args.temperature = min(args.temperature, 0.03)
+    args.auto_escalate = True
+
+
 def write_progress(path: Path, rows: list[dict]) -> None:
     if not rows:
         return
@@ -387,6 +408,69 @@ def try_teleport_weakest_glint(
     }
 
 
+def auto_escalate_patch(
+    patch: GradientLightPatch,
+    args,
+    step: int,
+    target_index: int,
+    actual_score: float,
+    actual_detection: dict | None,
+    escalation_count: int,
+) -> tuple[bool, dict]:
+    if not args.auto_escalate:
+        return False, {}
+    if args.auto_escalation_limit > 0 and escalation_count >= args.auto_escalation_limit:
+        return False, {}
+
+    before_count = patch.glare_count
+    before_max_size = patch.max_size_frac
+    before_naturalness = args.naturalness_weight
+    before_lr = args.lr
+
+    changed = False
+    can_grow = args.max_glare_count <= 0 or patch.glare_count < args.max_glare_count
+    if can_grow:
+        if args.max_glare_count <= 0:
+            add_count = args.auto_glints_per_escalation
+        else:
+            add_count = min(args.auto_glints_per_escalation, args.max_glare_count - patch.glare_count)
+        patch.add_glint(add_count)
+        changed = changed or add_count > 0
+
+    if patch.max_size_frac < args.auto_max_size_frac:
+        patch.max_size_frac = min(args.auto_max_size_frac, patch.max_size_frac * args.auto_size_multiplier)
+        changed = changed or patch.max_size_frac > before_max_size
+
+    if args.naturalness_weight > args.auto_min_naturalness_weight:
+        args.naturalness_weight = max(
+            args.auto_min_naturalness_weight,
+            args.naturalness_weight * args.auto_naturalness_multiplier,
+        )
+        changed = changed or args.naturalness_weight < before_naturalness
+
+    if args.auto_lr_multiplier > 1.0:
+        args.lr = min(args.auto_max_lr, args.lr * args.auto_lr_multiplier)
+        changed = changed or args.lr > before_lr
+
+    event = {
+        "target_index": target_index,
+        "step": step,
+        "reason": "auto_escalate",
+        "actual_detection_score": actual_score,
+        "actual_detection_class": actual_detection["class_name"] if actual_detection else None,
+        "escalation_index": escalation_count + 1,
+        "glare_count_before": before_count,
+        "glare_count_after": patch.glare_count,
+        "max_size_frac_before": before_max_size,
+        "max_size_frac_after": patch.max_size_frac,
+        "naturalness_weight_before": before_naturalness,
+        "naturalness_weight_after": args.naturalness_weight,
+        "lr_before": before_lr,
+        "lr_after": args.lr,
+    }
+    return changed, event
+
+
 def optimize_target(
     raw_model,
     detect_model,
@@ -422,6 +506,10 @@ def optimize_target(
     growth_events = []
     last_improvement_step = 0
     last_growth_step = -args.growth_cooldown
+    actual_check_count = 0
+    best_actual_score = float("inf")
+    last_actual_improvement_check = 0
+    escalation_count = 0
     stop_reason = "step_budget"
     max_steps = args.max_steps if args.until_disappeared else args.steps
     unlimited_steps = args.until_disappeared and max_steps <= 0
@@ -590,6 +678,10 @@ def optimize_target(
                 progress[-1]["actual_detection_class"] = (
                     actual_detection["class_name"] if actual_detection else None
                 )
+                actual_check_count += 1
+                if actual_score < best_actual_score - args.actual_plateau_delta:
+                    best_actual_score = actual_score
+                    last_actual_improvement_check = actual_check_count
                 print(
                     "Actual original-size YOLO check at step "
                     f"{step}: any-overlap score={actual_score:.4f} "
@@ -608,6 +700,42 @@ def optimize_target(
                     best["actual_detection_score"] = actual_score
                     stop_reason = "disappeared"
                     break
+                actual_stalled = (
+                    args.auto_escalate
+                    and actual_check_count - last_actual_improvement_check >= args.actual_plateau_checks
+                )
+                if actual_stalled:
+                    escalated, auto_event = auto_escalate_patch(
+                        patch,
+                        args,
+                        step,
+                        target_index,
+                        actual_score,
+                        actual_detection,
+                        escalation_count,
+                    )
+                    if escalated:
+                        escalation_count += 1
+                        optimizer = torch.optim.Adam(patch.parameters(), lr=args.lr)
+                        last_growth_step = step
+                        last_improvement_step = step
+                        last_actual_improvement_check = actual_check_count
+                        growth_events.append(auto_event)
+                        progress[-1]["auto_escalated"] = True
+                        progress[-1]["auto_escalation_index"] = escalation_count
+                        progress[-1]["glare_count"] = patch.glare_count
+                        print(
+                            "Actual YOLO score stalled; auto-escalated "
+                            f"glints {auto_event['glare_count_before']} -> {auto_event['glare_count_after']}, "
+                            f"max_size {auto_event['max_size_frac_before']:.3f} -> "
+                            f"{auto_event['max_size_frac_after']:.3f}, "
+                            f"naturalness {auto_event['naturalness_weight_before']:.4f} -> "
+                            f"{auto_event['naturalness_weight_after']:.4f}."
+                        )
+                    elif args.auto_stop_when_exhausted:
+                        stop_reason = "auto_exhausted"
+                        best["actual_detection_score"] = actual_score
+                        break
 
         if step % args.print_every == 0 or (not unlimited_steps and step == max_steps - 1):
             print(
@@ -630,6 +758,11 @@ def main() -> None:
     parser.add_argument("--source-class", default=None)
     parser.add_argument("--region", type=parse_region, default=None)
     parser.add_argument("--steps", type=int, default=500)
+    parser.add_argument(
+        "--auto-attack",
+        action="store_true",
+        help="Use stronger self-tuning defaults and stop with a clear reason instead of requiring manual tuning.",
+    )
     parser.add_argument("--until-disappeared", action="store_true")
     parser.add_argument("--max-steps", type=int, default=0, help="Only used with --until-disappeared. 0 means no cap.")
     parser.add_argument("--check-every", type=int, default=50)
@@ -651,6 +784,40 @@ def main() -> None:
     parser.add_argument("--plateau-window", type=int, default=80)
     parser.add_argument("--plateau-delta", type=float, default=1e-3)
     parser.add_argument("--growth-cooldown", type=int, default=40)
+    parser.add_argument(
+        "--auto-escalate",
+        action="store_true",
+        default=True,
+        help="When actual YOLO checks stall, automatically add capacity and relax naturalness constraints.",
+    )
+    parser.add_argument(
+        "--no-auto-escalate",
+        action="store_false",
+        dest="auto_escalate",
+        help="Disable actual-score-driven runtime escalation.",
+    )
+    parser.add_argument("--actual-plateau-checks", type=int, default=3)
+    parser.add_argument("--actual-plateau-delta", type=float, default=0.02)
+    parser.add_argument("--auto-glints-per-escalation", type=int, default=2)
+    parser.add_argument("--auto-escalation-limit", type=int, default=8, help="0 means unlimited escalations.")
+    parser.add_argument("--auto-max-size-frac", type=float, default=0.30)
+    parser.add_argument("--auto-size-multiplier", type=float, default=1.25)
+    parser.add_argument("--auto-min-naturalness-weight", type=float, default=0.0)
+    parser.add_argument("--auto-naturalness-multiplier", type=float, default=0.55)
+    parser.add_argument("--auto-lr-multiplier", type=float, default=1.15)
+    parser.add_argument("--auto-max-lr", type=float, default=0.12)
+    parser.add_argument(
+        "--auto-stop-when-exhausted",
+        action="store_true",
+        default=True,
+        help="Stop with stop_reason=auto_exhausted if escalation cannot continue.",
+    )
+    parser.add_argument(
+        "--no-auto-stop-when-exhausted",
+        action="store_false",
+        dest="auto_stop_when_exhausted",
+        help="Keep optimizing after auto escalation options are exhausted.",
+    )
     parser.add_argument(
         "--teleport-on-plateau",
         action="store_true",
@@ -700,10 +867,17 @@ def main() -> None:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
+    apply_auto_attack_defaults(args)
     args.check_every = max(1, args.check_every)
     args.print_every = max(1, args.print_every)
     args.plateau_window = max(1, args.plateau_window)
     args.growth_cooldown = max(1, args.growth_cooldown)
+    args.actual_plateau_checks = max(1, args.actual_plateau_checks)
+    args.actual_plateau_delta = max(0.0, args.actual_plateau_delta)
+    args.auto_glints_per_escalation = max(1, args.auto_glints_per_escalation)
+    args.auto_size_multiplier = max(1.0, args.auto_size_multiplier)
+    args.auto_naturalness_multiplier = min(max(args.auto_naturalness_multiplier, 0.0), 1.0)
+    args.auto_lr_multiplier = max(1.0, args.auto_lr_multiplier)
     args.teleport_candidates = max(1, args.teleport_candidates)
     args.teleport_steps = max(1, args.teleport_steps)
     args.teleport_delta = max(0.0, args.teleport_delta)
@@ -865,6 +1039,7 @@ def main() -> None:
         "weights": args.weights,
         "device": device,
         "attack": "gradient_disappear",
+        "auto_attack": args.auto_attack,
         "imgsz": args.imgsz,
         "steps": args.steps,
         "until_disappeared": args.until_disappeared,
@@ -877,6 +1052,14 @@ def main() -> None:
         "plateau_window": args.plateau_window,
         "plateau_delta": args.plateau_delta,
         "growth_cooldown": args.growth_cooldown,
+        "auto_escalate": args.auto_escalate,
+        "actual_plateau_checks": args.actual_plateau_checks,
+        "actual_plateau_delta": args.actual_plateau_delta,
+        "auto_glints_per_escalation": args.auto_glints_per_escalation,
+        "auto_escalation_limit": args.auto_escalation_limit,
+        "auto_max_size_frac": args.auto_max_size_frac,
+        "auto_min_naturalness_weight": args.auto_min_naturalness_weight,
+        "auto_stop_when_exhausted": args.auto_stop_when_exhausted,
         "teleport_on_plateau": args.teleport_on_plateau,
         "teleport_candidates": args.teleport_candidates,
         "teleport_steps": args.teleport_steps,
