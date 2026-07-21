@@ -1,0 +1,4 @@
+target_index,target_class,removed_glint_index,glare_count_before,glare_count_after,post_prune_score,post_prune_class
+0,person,32,48,47,0.0,
+0,person,36,47,46,0.0,
+0,person,40,46,45,0.0,
