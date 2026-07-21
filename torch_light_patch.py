@@ -110,8 +110,8 @@ class GradientLightPatch(nn.Module):
         radius_y = radius_rel[:, 1] * base
 
         angle = torch.sigmoid(self.raw_angle) * torch.pi
-        opacity = 0.03 + torch.sigmoid(self.raw_opacity) * 0.72
-        intensity = 0.08 + torch.sigmoid(self.raw_intensity) * 1.45
+        opacity = 0.02 + torch.sigmoid(self.raw_opacity) * 0.38
+        intensity = 0.05 + torch.sigmoid(self.raw_intensity) * 0.75
         red = torch.ones_like(opacity)
         green = 0.74 + torch.sigmoid(self.raw_green) * 0.24
         blue = 0.45 + torch.sigmoid(self.raw_blue) * 0.35
@@ -141,7 +141,7 @@ class GradientLightPatch(nn.Module):
             mask = torch.exp(-3.2 * dist) * opacity[i] * clip
             glare = mask.view(1, 1, height, width)
             tint = color[i].view(1, 3, 1, 1)
-            out = out * (1.0 + 0.42 * glare) + tint * intensity[i] * 0.48 * glare
+            out = out * (1.0 + 0.22 * glare) + tint * intensity[i] * 0.28 * glare
             out = torch.clamp(out, 0.0, 1.0)
             combined_mask = torch.maximum(combined_mask, mask)
 
@@ -154,7 +154,7 @@ class GradientLightPatch(nn.Module):
         peak = mask.max()
         tv_y = torch.mean(torch.abs(mask[1:, :] - mask[:-1, :]))
         tv_x = torch.mean(torch.abs(mask[:, 1:] - mask[:, :-1]))
-        return area + 0.12 * peak + 0.03 * (tv_x + tv_y)
+        return 2.5 * area + 0.60 * peak + 0.08 * (tv_x + tv_y)
 
     def export(self, box_xyxy: torch.Tensor) -> ExportedGlints:
         with torch.no_grad():
@@ -212,7 +212,7 @@ def render_exported_glints(
         mask = torch.exp(-3.2 * dist) * float(opacity) * clip
         glare = mask.view(1, 1, height, width)
         tint = torch.tensor(color_rgb, device=device, dtype=torch.float32).view(1, 3, 1, 1)
-        out = out * (1.0 + 0.42 * glare) + tint * float(intensity) * 0.48 * glare
+        out = out * (1.0 + 0.22 * glare) + tint * float(intensity) * 0.28 * glare
         out = torch.clamp(out, 0.0, 1.0)
         combined_mask = torch.maximum(combined_mask, mask)
     return out, combined_mask

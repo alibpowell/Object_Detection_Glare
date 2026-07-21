@@ -38,7 +38,9 @@ def disappearance_loss(
         raise ValueError(f"Expected YOLO raw prediction shape [B, C, N], got {tuple(preds.shape)}")
     pred = preds[0].transpose(0, 1)
     boxes = xywh_to_xyxy(pred[:, :4])
-    class_scores = pred[:, 4 + source_class_id]
+    # For a true disappearance attack, suppress any class in the target region.
+    # Suppressing only source_class_id can turn the attack into misclassification.
+    class_scores = pred[:, 4:].amax(dim=1)
 
     centers = pred[:, :2]
     inside = (

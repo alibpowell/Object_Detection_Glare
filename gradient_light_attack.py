@@ -17,7 +17,7 @@ import torch
 from ultralytics import YOLO
 
 from image_io import ensure_dir, load_image_bgr, save_image
-from torch_light_patch import GradientLightPatch, render_exported_glints
+from torch_light_patch import ExportedGlints, GradientLightPatch, render_exported_glints
 from yolo_raw_loss import disappearance_loss
 from yolo_utils import (
     box_iou,
@@ -138,8 +138,6 @@ def glint_count(glints) -> int:
 
 
 def remove_glint(glints, index: int):
-    from torch_light_patch import ExportedGlints
-
     return ExportedGlints(
         center=[value for idx, value in enumerate(glints.center) if idx != index],
         radius=[value for idx, value in enumerate(glints.radius) if idx != index],
@@ -148,6 +146,65 @@ def remove_glint(glints, index: int):
         intensity=[value for idx, value in enumerate(glints.intensity) if idx != index],
         color_rgb=[value for idx, value in enumerate(glints.color_rgb) if idx != index],
     )
+
+
+def clone_glints(glints) -> ExportedGlints:
+    return ExportedGlints(
+        center=[list(value) for value in glints.center],
+        radius=[list(value) for value in glints.radius],
+        angle=list(glints.angle),
+        opacity=list(glints.opacity),
+        intensity=list(glints.intensity),
+        color_rgb=[list(value) for value in glints.color_rgb],
+    )
+
+
+def mutate_glints(glints, rng: np.random.Generator, args, scale: float):
+    mutated = clone_glints(glints)
+    if glint_count(mutated) == 0:
+        return mutated
+
+    index = int(rng.integers(0, glint_count(mutated)))
+    mutated.center[index][0] = float(np.clip(mutated.center[index][0] + rng.normal(0, 0.16 * scale), 0.0, 1.0))
+    mutated.center[index][1] = float(np.clip(mutated.center[index][1] + rng.normal(0, 0.16 * scale), 0.0, 1.0))
+    mutated.radius[index][0] = float(
+        np.clip(
+            mutated.radius[index][0] * np.exp(rng.normal(0, 0.35 * scale)),
+            args.min_size_frac,
+            args.polish_max_size_frac,
+        )
+    )
+    mutated.radius[index][1] = float(
+        np.clip(
+            mutated.radius[index][1] * np.exp(rng.normal(0, 0.35 * scale)),
+            args.min_size_frac,
+            args.polish_max_size_frac,
+        )
+    )
+    mutated.angle[index] = float((mutated.angle[index] + rng.normal(0, 0.7 * scale)) % np.pi)
+    mutated.opacity[index] = float(np.clip(mutated.opacity[index] + rng.normal(0, 0.12 * scale), 0.02, args.polish_max_opacity))
+    mutated.intensity[index] = float(
+        np.clip(mutated.intensity[index] + rng.normal(0, 0.22 * scale), 0.05, args.polish_max_intensity)
+    )
+
+    # Keep light warm, but allow small color variation.
+    mutated.color_rgb[index][0] = 1.0
+    mutated.color_rgb[index][1] = float(np.clip(mutated.color_rgb[index][1] + rng.normal(0, 0.04 * scale), 0.65, 1.0))
+    mutated.color_rgb[index][2] = float(np.clip(mutated.color_rgb[index][2] + rng.normal(0, 0.06 * scale), 0.35, 0.9))
+    return mutated
+
+
+def append_random_glint(glints, rng: np.random.Generator, args) -> ExportedGlints:
+    mutated = clone_glints(glints)
+    mutated.center.append([float(rng.random()), float(rng.random())])
+    radius_x = float(rng.uniform(args.min_size_frac, args.polish_max_size_frac))
+    radius_y = float(rng.uniform(args.min_size_frac, args.polish_max_size_frac))
+    mutated.radius.append([radius_x, radius_y])
+    mutated.angle.append(float(rng.uniform(0, np.pi)))
+    mutated.opacity.append(float(rng.uniform(0.08, args.polish_max_opacity)))
+    mutated.intensity.append(float(rng.uniform(0.12, args.polish_max_intensity)))
+    mutated.color_rgb.append([1.0, float(rng.uniform(0.75, 1.0)), float(rng.uniform(0.45, 0.85))])
+    return mutated
 
 
 def evaluate_glints_on_original(
@@ -171,6 +228,92 @@ def evaluate_glints_on_original(
     target_box = tuple(float(v) for v in target_box_original.detach().cpu().tolist())
     score, detection = max_any_detection_score(detections, target_box)
     return score, detection, attacked_original
+
+
+def polish_glints_against_actual_yolo(
+    detect_model,
+    base_image_original: torch.Tensor,
+    target_box_original: torch.Tensor,
+    glints,
+    target: dict,
+    args,
+    device: str,
+    seed: int,
+) -> tuple[object, list[dict], torch.Tensor]:
+    rng = np.random.default_rng(seed)
+    best_glints = clone_glints(glints)
+    best_score, best_detection, best_image = evaluate_glints_on_original(
+        detect_model,
+        base_image_original,
+        target_box_original,
+        best_glints,
+        args,
+        device,
+    )
+    events = [
+        {
+            "iteration": -1,
+            "score": best_score,
+            "detection_class": best_detection["class_name"] if best_detection else None,
+            "glare_count": glint_count(best_glints),
+            "accepted": True,
+            "reason": "initial",
+        }
+    ]
+    if best_score == 0.0:
+        return best_glints, events, best_image
+
+    for iteration in range(args.polish_iterations):
+        scale = max(0.08, 1.0 - iteration / max(args.polish_iterations - 1, 1))
+        candidates = []
+        for _ in range(args.polish_candidates):
+            if (
+                args.polish_add_glints
+                and glint_count(best_glints) < args.polish_max_glare_count
+                and rng.random() < args.polish_add_probability
+            ):
+                candidates.append((append_random_glint(best_glints, rng, args), "add_glint"))
+            else:
+                candidates.append((mutate_glints(best_glints, rng, args, scale), "mutate"))
+
+        accepted = False
+        for candidate_glints, reason in candidates:
+            score, detection, image = evaluate_glints_on_original(
+                detect_model,
+                base_image_original,
+                target_box_original,
+                candidate_glints,
+                args,
+                device,
+            )
+            if score < best_score - args.polish_delta:
+                best_glints = candidate_glints
+                best_score = score
+                best_detection = detection
+                best_image = image
+                accepted = True
+                events.append(
+                    {
+                        "iteration": iteration,
+                        "score": best_score,
+                        "detection_class": best_detection["class_name"] if best_detection else None,
+                        "glare_count": glint_count(best_glints),
+                        "accepted": True,
+                        "reason": reason,
+                    }
+                )
+                break
+
+        if iteration % args.polish_print_every == 0 or accepted:
+            cls = best_detection["class_name"] if best_detection else "none"
+            print(
+                f"Polish [{iteration:04d}/{args.polish_iterations}] "
+                f"actual_score={best_score:.4f} class={cls} glints={glint_count(best_glints)}"
+            )
+        if best_score == 0.0:
+            break
+
+    return best_glints, events, best_image
 
 
 def prune_successful_glints(
@@ -767,6 +910,39 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, default=0, help="Only used with --until-disappeared. 0 means no cap.")
     parser.add_argument("--check-every", type=int, default=50)
     parser.add_argument(
+        "--polish-actual",
+        action="store_true",
+        default=True,
+        help="After gradient optimization, directly mutate glints against actual postprocessed YOLO detections.",
+    )
+    parser.add_argument(
+        "--no-polish-actual",
+        action="store_false",
+        dest="polish_actual",
+        help="Disable direct actual-YOLO polishing.",
+    )
+    parser.add_argument("--polish-iterations", type=int, default=300)
+    parser.add_argument("--polish-candidates", type=int, default=8)
+    parser.add_argument("--polish-delta", type=float, default=1e-4)
+    parser.add_argument("--polish-print-every", type=int, default=25)
+    parser.add_argument("--polish-max-size-frac", type=float, default=0.30)
+    parser.add_argument("--polish-max-opacity", type=float, default=0.75)
+    parser.add_argument("--polish-max-intensity", type=float, default=1.4)
+    parser.add_argument("--polish-max-glare-count", type=int, default=60)
+    parser.add_argument("--polish-add-probability", type=float, default=0.20)
+    parser.add_argument(
+        "--polish-add-glints",
+        action="store_true",
+        default=True,
+        help="Allow actual-YOLO polishing to add glints when mutation is not enough.",
+    )
+    parser.add_argument(
+        "--no-polish-add-glints",
+        action="store_false",
+        dest="polish_add_glints",
+        help="Disable glint growth during actual-YOLO polishing.",
+    )
+    parser.add_argument(
         "--prune-glints",
         action="store_true",
         default=True,
@@ -870,6 +1046,15 @@ def main() -> None:
     apply_auto_attack_defaults(args)
     args.check_every = max(1, args.check_every)
     args.print_every = max(1, args.print_every)
+    args.polish_iterations = max(0, args.polish_iterations)
+    args.polish_candidates = max(1, args.polish_candidates)
+    args.polish_delta = max(0.0, args.polish_delta)
+    args.polish_print_every = max(1, args.polish_print_every)
+    args.polish_max_size_frac = max(args.min_size_frac, args.polish_max_size_frac)
+    args.polish_max_opacity = max(0.02, args.polish_max_opacity)
+    args.polish_max_intensity = max(0.05, args.polish_max_intensity)
+    args.polish_max_glare_count = max(args.glare_count, args.polish_max_glare_count)
+    args.polish_add_probability = min(max(args.polish_add_probability, 0.0), 1.0)
     args.plateau_window = max(1, args.plateau_window)
     args.growth_cooldown = max(1, args.growth_cooldown)
     args.actual_plateau_checks = max(1, args.actual_plateau_checks)
@@ -928,6 +1113,7 @@ def main() -> None:
     all_progress = []
     all_growth_events = []
     all_prune_events = []
+    all_polish_events = []
     patches = []
 
     for target_index, target in enumerate(targets):
@@ -947,6 +1133,47 @@ def main() -> None:
             device,
         )
         prune_events = []
+        polish_events = []
+        if args.polish_actual:
+            before_score, before_detection, _ = evaluate_glints_on_original(
+                detect_yolo,
+                current_original,
+                target_box_original,
+                best["glints"],
+                args,
+                device,
+            )
+            print(
+                "Starting actual-YOLO polish: "
+                f"score={before_score:.4f} class={before_detection['class_name'] if before_detection else 'none'}"
+            )
+            best["glints"], polish_events, polished_original = polish_glints_against_actual_yolo(
+                detect_yolo,
+                current_original,
+                target_box_original,
+                best["glints"],
+                target,
+                args,
+                device,
+                seed=args.seed + 100000 + target_index,
+            )
+            after_score, after_detection, _ = evaluate_glints_on_original(
+                detect_yolo,
+                current_original,
+                target_box_original,
+                best["glints"],
+                args,
+                device,
+            )
+            best["actual_detection_score"] = after_score
+            best["glare_count"] = glint_count(best["glints"])
+            if after_score == 0.0:
+                best["stop_reason"] = "disappeared"
+            print(
+                "Finished actual-YOLO polish: "
+                f"score={after_score:.4f} class={after_detection['class_name'] if after_detection else 'none'}"
+            )
+
         if args.prune_glints and best["stop_reason"] == "disappeared":
             before_count = glint_count(best["glints"])
             best["glints"], prune_events, current_original = prune_successful_glints(
@@ -954,6 +1181,7 @@ def main() -> None:
                 current_original,
                 target_box_original,
                 best["glints"],
+                target,
                 args,
                 device,
             )
@@ -969,6 +1197,14 @@ def main() -> None:
         current_original = current_original.detach()
         all_progress.extend(progress)
         all_growth_events.extend(growth_events)
+        for event in polish_events:
+            all_polish_events.append(
+                {
+                    "target_index": target_index,
+                    "target_class": target["class_name"],
+                    **event,
+                }
+            )
         for event in prune_events:
             all_prune_events.append(
                 {
@@ -989,6 +1225,7 @@ def main() -> None:
                 "actual_detection_score": best["actual_detection_score"],
                 "stop_reason": best["stop_reason"],
                 "steps_run": best["steps_run"],
+                "polish_events": polish_events,
                 "prune_events": prune_events,
                 "pruned_glare_count": glint_count(best["glints"]),
                 "glints": asdict(best["glints"]),
@@ -1033,6 +1270,7 @@ def main() -> None:
 
     write_progress(output_dir / "gradient_progress.csv", all_progress)
     write_progress(output_dir / "growth_events.csv", all_growth_events)
+    write_progress(output_dir / "polish_events.csv", all_polish_events)
     write_progress(output_dir / "prune_events.csv", all_prune_events)
     summary = {
         "image": str(image_path),
@@ -1046,6 +1284,13 @@ def main() -> None:
         "max_steps": args.max_steps,
         "check_every": args.check_every,
         "prune_glints": args.prune_glints,
+        "polish_actual": args.polish_actual,
+        "polish_iterations": args.polish_iterations,
+        "polish_candidates": args.polish_candidates,
+        "polish_max_size_frac": args.polish_max_size_frac,
+        "polish_max_opacity": args.polish_max_opacity,
+        "polish_max_intensity": args.polish_max_intensity,
+        "polish_max_glare_count": args.polish_max_glare_count,
         "lr": args.lr,
         "glare_count": args.glare_count,
         "max_glare_count": args.max_glare_count,
@@ -1065,6 +1310,7 @@ def main() -> None:
         "teleport_steps": args.teleport_steps,
         "teleport_delta": args.teleport_delta,
         "growth_events": all_growth_events,
+        "polish_events": all_polish_events,
         "prune_events": all_prune_events,
         "naturalness_weight": args.naturalness_weight,
         "min_size_frac": args.min_size_frac,
