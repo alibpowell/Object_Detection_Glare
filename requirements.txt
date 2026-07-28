@@ -1,5 +1,7 @@
-numpy
-opencv-python
-pillow
-pillow-avif-plugin
-ultralytics
+numpy>=2.0,<3
+opencv-python>=4.10,<6
+pillow>=11,<13
+pillow-avif-plugin>=1.5,<2
+torch>=2.5,<3
+ultralytics>=8.3,<9
+pytest>=8,<10

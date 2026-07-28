@@ -1,10 +1,63 @@
 # YOLO Light-Glare Disappearance Attack
 
-This repository is a research prototype for testing whether synthetic, natural-looking light glare can suppress YOLO detections in still images.
+> **Experimental research project.** This repository explores whether synthetic,
+> natural-looking light glare can suppress YOLO detections in still images. It is
+> intentionally an evolving experiment rather than a finished library or
+> production-ready adversarial-vision framework. The primary script keeps the
+> optimization, escalation, validation, polishing, pruning, and diagnostics
+> together while those ideas are still being actively tested; its size reflects
+> that experimental breadth.
+
+The project is built to make those experiments reproducible and inspectable: it
+records the actual postprocessed YOLO result, exports the learned glare
+parameters, and saves detailed CSV/JSON diagnostics instead of reporting only a
+best-case image.
 
 The main workflow is `gradient_light_attack.py`. It freezes a YOLO model, optimizes differentiable glare/glint parameters with PyTorch, checks the actual postprocessed YOLO detections on the original-size image, optionally polishes the result against real YOLO outputs, and prunes unnecessary glints after success.
 
 There is also an older black-box search path in `attack_yolo.py`. It is useful for simpler experiments, but the gradient attack is the current focus.
+
+## Research Goal
+
+The long-term goal is to move beyond a purely digital image attack. This project
+asks whether the optimized light positions, shapes, colors, and intensities found
+in simulation could eventually be reproduced with a projector and cast onto a
+real object. If the digital-to-physical transfer succeeds, projected light could
+act as a new kind of adversarial object-detection patch: one that does not need
+to be printed or permanently attached to the object, but instead uses controlled
+illumination to deliberately make an object disappear from a detector or be
+mislabeled.
+
+The current repository is the first, digital stage of that investigation. It
+searches for effective light patterns, measures them against real postprocessed
+YOLO outputs, and exports the learned parameters needed for later projection and
+physical-world testing. Robust physical transfer has not yet been demonstrated;
+future work must account for projector calibration, surface geometry and
+reflectance, ambient lighting, viewpoint changes, distance, camera exposure, and
+detector/model variation.
+
+The broader motivation is adversarial-robustness research: understanding this
+possible failure mode can help evaluate and improve vision systems before they
+are trusted in physical environments.
+
+## Example Result
+
+In the tracked example run below, YOLOv8n initially detected one `person` with
+`0.8778` confidence. After the optimized glints were rendered, the same YOLO
+pipeline returned no detections anywhere in the image. The saved summary records
+`image_fully_clear: true`, `attacked_detections: []`, and a final overlapping
+detection score of `0.0`.
+
+| Original YOLO detections | After optimized glare |
+| --- | --- |
+| ![Original image with a person detection at 0.88 confidence](outputs/gradient_run_20260717_154642/original_detections.jpg) | ![Attacked image with generated light glints and no YOLO detections](outputs/gradient_run_20260717_154642/attacked_detections.jpg) |
+
+*Example image source: [JLo Beauty (@jlobeauty) on Instagram](https://www.instagram.com/jlobeauty/).*
+
+This is one successful experimental run, not a claim that the method defeats
+every detector, model version, image, or preprocessing pipeline. Its complete
+parameters and diagnostics are retained in
+[`attack_summary.json`](outputs/gradient_run_20260717_154642/attack_summary.json).
 
 ## Repository Layout
 
@@ -35,6 +88,12 @@ There is also an older black-box search path in `attack_yolo.py`. It is useful f
 `image_io.py`
 : Image loading and saving utilities, including Pillow fallback for AVIF/WebP-like formats.
 
+`tests/`
+: Fast unit tests for detection scoring, overlap math, differentiable loss, glare rendering, and image I/O.
+
+`examples/commands.md`
+: Commands retained from successful or useful experimental runs.
+
 `inputs/`
 : Example images.
 
@@ -54,6 +113,12 @@ Install dependencies:
 
 ```bash
 python -m pip install -r requirements.txt
+```
+
+Run the automated tests:
+
+```bash
+python -m pytest
 ```
 
 The first YOLO run will download `yolov8n.pt` if it is not already present.
@@ -155,6 +220,74 @@ only when the final attacked image has zero YOLO detections anywhere.
 ### Differentiable Loss
 
 The raw loss suppresses the top raw YOLO predictions overlapping the target box. It is class-agnostic inside the target region, so it suppresses replacement classes too.
+
+#### Glare model
+
+Each glint is a rotated elliptical Gaussian. For pixel coordinates
+\((x, y)\), center \((c_x, c_y)\), rotation \(\theta\), and radii
+\((r_x, r_y)\), the rotated coordinates and elliptical distance are:
+
+$$
+\begin{aligned}
+x' &= \cos(\theta)(x-c_x) + \sin(\theta)(y-c_y), \\
+y' &= -\sin(\theta)(x-c_x) + \cos(\theta)(y-c_y), \\
+d(x,y) &= \left(\frac{x'}{r_x}\right)^2 +
+          \left(\frac{y'}{r_y}\right)^2.
+\end{aligned}
+$$
+
+The opacity mask for glint \(i\) is clipped to the original target box
+\(B\):
+
+$$
+m_i(x,y) = \alpha_i e^{-3.2d_i(x,y)}\,\mathbf{1}[(x,y)\in B].
+$$
+
+Given warm RGB tint \(\mathbf{c}_i\) and intensity \(q_i\), the renderer
+updates the image differentiably and clamps it to the valid range:
+
+$$
+\mathbf{I}_{i+1} = \operatorname{clip}_{[0,1]}\left(
+\mathbf{I}_i(1 + 0.22m_i) + 0.28q_i m_i\mathbf{c}_i
+\right).
+$$
+
+#### Detection objective
+
+Let \(S_B\) contain raw predictions whose centers fall inside the target box or
+whose predicted boxes have IoU greater than \(\tau\) with it. For each relevant
+prediction, \(s_j\) is its highest class score. The attack uses a temperature-
+controlled smooth maximum over the strongest relevant predictions:
+
+$$
+\mathcal{L}_{\mathrm{det}} = T\log\sum_{j\in\operatorname{TopK}(S_B)}
+\exp\left(\frac{s_j}{T}\right).
+$$
+
+Taking the maximum over every class is deliberate: minimizing only the original
+class could merely change `person` into another overlapping label instead of
+making the detection disappear.
+
+The naturalness penalty discourages a large, saturated, or spatially rough
+combined mask \(M\):
+
+$$
+\mathcal{L}_{\mathrm{nat}} =
+2.5\frac{\sum M}{\operatorname{area}(B)}
++ 0.60\max(M)
++ 0.08\left(\operatorname{TV}_x(M)+\operatorname{TV}_y(M)\right).
+$$
+
+The learnable glint parameters are optimized with Adam using:
+
+$$
+\mathcal{L} = \mathcal{L}_{\mathrm{det}} +
+\lambda_{\mathrm{nat}}\mathcal{L}_{\mathrm{nat}}.
+$$
+
+This differentiable objective guides the search, while periodic full YOLO
+inference on the original-size rendered image determines actual success after
+postprocessing and non-maximum suppression.
 
 Important knobs:
 
@@ -518,6 +651,10 @@ python -m pip install -r requirements.txt
 
 `Running on CPU.`
 : PyTorch did not see CUDA or MPS. Use `--device cuda:0` or `--device mps` only if your installed PyTorch supports that backend.
+
+## License
+
+Released under the [MIT License](LICENSE).
 
 `WARNING NMS time limit exceeded`
 : YOLO spent too long filtering many candidate boxes. Try raising `--conf`, lowering `--imgsz`, or checking less often with a larger `--check-every`.
