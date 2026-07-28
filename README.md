@@ -247,7 +247,7 @@ Given warm RGB tint \(\mathbf{c}_i\) and intensity \(q_i\), the renderer
 updates the image differentiably and clamps it to the valid range:
 
 $$
-\mathbf{I}_{i+1} = \operatorname{clip}_{[0,1]}\left(
+\mathbf{I}_{i+1} = \mathrm{clip}_{[0,1]}\left(
 \mathbf{I}_i(1 + 0.22m_i) + 0.28q_i m_i\mathbf{c}_i
 \right).
 $$
@@ -260,7 +260,7 @@ prediction, \(s_j\) is its highest class score. The attack uses a temperature-
 controlled smooth maximum over the strongest relevant predictions:
 
 $$
-\mathcal{L}_{\mathrm{det}} = T\log\sum_{j\in\operatorname{TopK}(S_B)}
+\mathcal{L}_{\mathrm{det}} = T\log\sum_{j\in\mathrm{TopK}(S_B)}
 \exp\left(\frac{s_j}{T}\right).
 $$
 
@@ -273,9 +273,9 @@ combined mask \(M\):
 
 $$
 \mathcal{L}_{\mathrm{nat}} =
-2.5\frac{\sum M}{\operatorname{area}(B)}
+2.5\frac{\sum M}{\mathrm{area}(B)}
 + 0.60\max(M)
-+ 0.08\left(\operatorname{TV}_x(M)+\operatorname{TV}_y(M)\right).
++ 0.08\left(\mathrm{TV}_x(M)+\mathrm{TV}_y(M)\right).
 $$
 
 The learnable glint parameters are optimized with Adam using:
