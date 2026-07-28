@@ -26,7 +26,8 @@ real object. If the digital-to-physical transfer succeeds, projected light could
 act as a new kind of adversarial object-detection patch: one that does not need
 to be printed or permanently attached to the object, but instead uses controlled
 illumination to deliberately make an object disappear from a detector or be
-mislabeled.
+mislabeled. The benefit being that this method of augmentation to an object could prove to 
+be much more natural looking than current high-contrast printed adversarial patches. 
 
 The current repository is the first, digital stage of that investigation. It
 searches for effective light patterns, measures them against real postprocessed
